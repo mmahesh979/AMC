@@ -1,0 +1,12 @@
+# Ignore Python caches and virtualenvs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Ignore local environment files (optional, keep .env committed if desired)
+# .env
+
+# Ignore reports directory contents
+Reports/
+
