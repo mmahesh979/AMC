@@ -16,6 +16,19 @@ source .venv/bin/activate          # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 ```
 
+## Run the web app
+
+This starts a minimal FastAPI server that exposes an HTML table and a JSON API for holdings. It reuses the Excel reader from this repo and respects `.env` (`REPORTS_DIR`).
+
+```
+uvicorn fastapi_app:app --reload
+```
+
+- HTML table: http://127.0.0.1:8000/holdings
+- JSON API:  http://127.0.0.1:8000/api/holdings
+
+The root `/` redirects to `/holdings`.
+
 ## Configuration (.env)
 You can specify the default reports directory via `.env`:
 
@@ -75,4 +88,3 @@ df = load_holdings_df(file_path="Reports/holdings-XYZ.xlsx")
 
 ## Git hygiene
 The repository includes a `.gitignore` that excludes `Reports/` so uploaded reports aren’t committed. Adjust as needed.
-

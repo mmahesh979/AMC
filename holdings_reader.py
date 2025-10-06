@@ -153,7 +153,7 @@ def load_holdings_df(
 
 
 def _normalize_cell(val: object) -> Optional[str]:
-    if pd.isna(val):
+    if pd.isna(val):    # type: ignore
         return None
     s = str(val).strip()
     return s if s != "" else None
@@ -190,15 +190,15 @@ def _find_table_header_bounds(raw: pd.DataFrame) -> Tuple[int, int, int]:
     # Determine start at the first 'Symbol'
     c_start = next(
         idx
-        for idx, v in enumerate((v.lower() if v else None) for v in header_vals_cache)
+        for idx, v in enumerate((v.lower() if v else None) for v in header_vals_cache) # type: ignore
         if v is not None and "symbol" in v
     )
 
     # Determine end as the last non-empty cell in the row
-    last_idx = len(header_vals_cache) - 1
+    last_idx = len(header_vals_cache) - 1 # type: ignore
     c_end = c_start
     for j in range(last_idx, c_start - 1, -1):
-        if _normalize_cell(header_vals_cache[j]) is not None:
+        if _normalize_cell(header_vals_cache[j]) is not None: # type: ignore
             c_end = j
             break
 
