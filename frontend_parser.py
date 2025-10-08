@@ -72,3 +72,83 @@ def compute_frontend_table(df: pd.DataFrame) -> pd.DataFrame:
     out["PNL%"] = pnlpct.round(0).astype(int).astype(str) + "%"
 
     return out
+
+
+def compute_sector_performance(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate holdings into a sector-level performance table.
+
+    Adds a "Stocks" column indicating the number of distinct symbols in each sector.
+    """
+
+    required = [
+        "Sector",
+        "Investment Value",
+        "Present Value",
+        "Net Pnl",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Missing required columns for sector performance aggregation: "
+            f"{missing}"
+        )
+
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "Sector",
+            "Stocks",
+            "Investment Value",
+            "Present Value",
+            "Net Pnl",
+            "Net Performance %",
+        ])
+
+    work = df.copy()
+    work["Sector"] = work["Sector"].replace({"": "Unspecified"}).fillna("Unspecified")
+
+    inv = pd.to_numeric(work["Investment Value"], errors="coerce").fillna(0.0)
+    present = pd.to_numeric(work["Present Value"], errors="coerce").fillna(0.0)
+    pnl = pd.to_numeric(work["Net Pnl"], errors="coerce").fillna(0.0)
+
+    work["Investment Value"] = inv
+    work["Present Value"] = present
+    work["Net Pnl"] = pnl
+
+    # Aggregate sums
+    sector = (
+        work.groupby("Sector", dropna=False)[["Investment Value", "Present Value", "Net Pnl"]]
+        .sum()
+        .reset_index()
+    )
+
+    # Count distinct symbols per sector
+    stocks = (
+        work.groupby("Sector", dropna=False)["Symbol"].nunique().rename("Stocks").reset_index()
+    )
+
+    # Merge counts
+    sector = sector.merge(stocks, on="Sector", how="left")
+
+    # Weighted average net performance based on investment value
+    performance = sector["Net Pnl"] / sector["Investment Value"].replace({0.0: pd.NA})
+    performance = performance.fillna(0.0) * 100
+
+    sector["Investment Value"] = sector["Investment Value"].round(2)
+    sector["Present Value"] = sector["Present Value"].round(2)
+    sector["Net Pnl"] = sector["Net Pnl"].round(2)
+    sector["Net Performance %"] = performance.round(2)
+
+    # Reorder columns for display
+    desired_cols = [
+        "Sector",
+        "Stocks",
+        "Investment Value",
+        "Present Value",
+        "Net Pnl",
+        "Net Performance %",
+    ]
+    sector = sector[desired_cols]
+
+    sector = sector.sort_values(by="Investment Value", ascending=False).reset_index(drop=True)
+
+    return sector
