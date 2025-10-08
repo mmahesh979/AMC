@@ -25,11 +25,22 @@ def api_holdings() -> Dict[str, Any]:
     try:
         df = holdings_reader.load_holdings_df()
         df = frontend_parser.compute_frontend_table(df)
+        sector_df = frontend_parser.compute_sector_performance(df)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     data: List[Dict[str, Any]] = df.to_dict(orient="records")  # pyright: ignore[reportAssignmentType, reportReturnType]
-    return JSONResponse(content={"columns": list(df.columns), "rows": data}) # pyright: ignore[reportReturnType]
+    sector_data: List[Dict[str, Any]] = sector_df.to_dict(orient="records")  # pyright: ignore[reportAssignmentType]
+    return JSONResponse(
+        content={
+            "columns": list(df.columns),
+            "rows": data,
+            "sector_summary": {
+                "columns": list(sector_df.columns),
+                "rows": sector_data,
+            },
+        }
+    )  # pyright: ignore[reportReturnType]
 
 
 @app.get("/holdings", response_class=HTMLResponse)
@@ -38,6 +49,7 @@ def html_holdings(request: Request):
     try:
         df = holdings_reader.load_holdings_df()
         df = frontend_parser.compute_frontend_table(df)
+        sector_df = frontend_parser.compute_sector_performance(df)
         # Best-effort: show the specific file used
         try:
             reports_dir = Path(holdings_reader.os.getenv("REPORTS_DIR") or "Reports")
@@ -52,6 +64,8 @@ def html_holdings(request: Request):
                 "request": request,
                 "columns": list(df.columns),
                 "rows": df.to_dict(orient="records"),
+                "sector_columns": list(sector_df.columns),
+                "sector_rows": sector_df.to_dict(orient="records"),
                 "source": source,
                 "error": None,
             },
@@ -64,6 +78,8 @@ def html_holdings(request: Request):
                 "request": request,
                 "columns": [],
                 "rows": [],
+                "sector_columns": [],
+                "sector_rows": [],
                 "source": source,
                 "error": str(exc),
             },
