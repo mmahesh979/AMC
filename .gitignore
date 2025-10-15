@@ -9,4 +9,5 @@ venv/
 
 # Ignore reports directory contents
 Reports/
+nse/
 
