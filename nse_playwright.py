@@ -1,225 +1,166 @@
-#!/usr/bin/env python3
-"""
-Simple Playwright script to open NSE equity quote page for a symbol
-and click the "Historical Data" tab.
+import argparse
+from typing import List
 
-Usage:
-  python nse_playwright.py --symbol HCLTECH            # headed (default)
-  python nse_playwright.py --symbol TCS --headless     # headless
-
-Notes:
-  - Requires: pip install playwright
-  - First time: python -m playwright install
-  - On some systems, you may need OS libs (see pw_deps.txt).
-"""
-
-from typing import Optional
-import time
-from datetime import date
 import pandas as pd
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
+
+DATE_FORMAT = "%Y-%m-%d"
+DISPLAY_FORMAT = "%d-%m-%Y"
 
 
-BASE = "https://www.nseindia.com"
-
-
-def main(symbol: str, headless_mode: bool = False, page_timeout_ms: int = 60_000) -> None:
-    """Open NSE quote page for the given symbol and click "Historical Data".
-
-    Args:
-        symbol: NSE equity symbol, e.g., "HCLTECH", "TCS", "RELIANCE".
-        headless: If True, runs without a visible window. Defaults to False.
-        page_timeout_ms: Navigation and selector timeout in ms. Defaults to 60000.
-    """
-
-    url = f"{BASE}/get-quotes/equity?symbol={symbol.upper()}"
-
+def open_historical_tab(
+    symbol: str,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+    headless: bool = True,
+) -> None:
+    url = f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless_mode)
-        context = browser.new_context(
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page(
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1400, "height": 900},
-            locale="en-US",
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-
-        page = context.new_page()
-        page.set_default_timeout(page_timeout_ms)
-        
-        #Navigate to the scrip
-        print(f"Navigating to: {url}")
-        page.goto(url, wait_until="domcontentloaded")
-        time.sleep(3)
-        print("Opening 'Historical Data' tab...")
-        try:
-            page.get_by_role("tab", name="Historical Data").click()
-            time.sleep(.5)
-
-            # Set custom date range via page JS (readonly-safe), then click Filter.
-            # Example: start = 01-04-2018, end = today (DD-MM-YYYY)
-            start_str = "01-04-2018"
-            end_str = date.today().strftime("%d-%m-%Y")
-
-            page.evaluate(
-                """
-                ({s, e}) => {
-                  const $ = window.$ || window.jQuery;
-
-                  const setViaPicker = (id, val) => {
-                    try {
-                      if ($ && $.fn && $.fn.datepicker && typeof $(('#'+id)).datepicker === 'function') {
-                        $(('#'+id)).datepicker('setDate', val);
-                        return true;
-                      }
-                    } catch (_){}
-                    try {
-                      const inst = $ ? ($(('#'+id)).data('datepicker') || $(('#'+id)).data('gj-datepicker')) : null;
-                      if (inst && typeof inst.value === 'function') { inst.value(val); return true; }
-                      if ($ && typeof $(('#'+id)).datepicker === 'function') {
-                        const maybe = $(('#'+id)).datepicker();
-                        if (maybe && typeof maybe.value === 'function') { maybe.value(val); return true; }
-                      }
-                    } catch (_){}
-                    return false;
-                  };
-
-                  const setDirect = (id, val) => {
-                    const el = document.getElementById(id);
-                    if (!el) return;
-                    el.value = val;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                  };
-
-                  if (!setViaPicker('startDate1', s)) setDirect('startDate1', s);
-                  if (!setViaPicker('endDate1', e)) setDirect('endDate1', e);
-
-                  // Clear any active preset chip so it won't override custom range
-                  try { document.querySelectorAll('.dayslisting .active').forEach(n => n.classList.remove('active')); } catch (_){}
-                }
-                """,
-                {"s": start_str, "e": end_str},
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
             )
-            time.sleep(5)
+        )
+        try:
+            tab = page.get_by_role("tab", name="Historical Data")
+            table = page.locator("#equityHistoricalTable")
 
-            page.get_by_role("button", name="Filter").click()
-            page.wait_for_load_state("networkidle")
-        except:
-            pass
-            # Scope table and use relative XPath (scoped with .//)
-        #     table = page.locator("id=equityHistoricalTable").first
+            for attempt in range(3):
+                if attempt:
+                    page.reload(wait_until="domcontentloaded")
+                else:
+                    page.goto(url, wait_until="domcontentloaded")
+                tab.click()
+                try:
+                    table.wait_for(state="visible", timeout=2000)
+                    break
+                except PlaywrightTimeoutError:
+                    page.wait_for_timeout(2000)
+            else:
+                raise RuntimeError("Response NA")
 
-        #     # Extract headers row-wise via XPath scoped to table
-        #     headers_nodes = table.locator("xpath=.//thead//th").all()
-        #     headers = [h.inner_text().replace("\n", " ").strip() for h in headers_nodes]
-        #     if not headers:
-        #         raise RuntimeError("No headers found in equityHistoricalTable")
+            all_frames: List[pd.DataFrame] = []
+            corporate_events: List[List[str]] = []
+            current_end = end_date
 
-        #     # Validate first column is DATE (ignore case)
-        #     if headers[0].strip().lower() != "date":
-        #         raise RuntimeError("date_column_missing")
+            while current_end >= start_date:
+                window_start = current_end - pd.DateOffset(years=1)
+                if window_start < start_date:
+                    window_start = start_date
 
-        #     # Collect rows for performant DataFrame creation and diagnostics
-        #     rows_buffer = []  # list[list[str|NA]]
-        #     data_errors = []  # {scrip, date, missing_values}
-        #     corp_events = []  # {scrip, date, title, href}
+                page.evaluate(
+                    """({ start, end }) => {
+                        if (window.$) {
+                            window.$('#startDate1').datepicker().value(start);
+                            window.$('#endDate1').datepicker().value(end);
+                        }
+                    }""",
+                    {
+                        "start": window_start.strftime(DISPLAY_FORMAT),
+                        "end": current_end.strftime(DISPLAY_FORMAT),
+                    },
+                )
+                page.get_by_role("button", name="Filter").click()
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except PlaywrightTimeoutError:
+                    pass
+                page.wait_for_timeout(1000)
+                tab.click()
+                try:
+                    table.wait_for(state="visible", timeout=2000)
+                except PlaywrightTimeoutError:
+                    break
 
-        #     # Iterate rows and extract cells row-wise
-        #     row_nodes = table.locator("xpath=.//tbody//tr")
-        #     row_count = row_nodes.count()
-        #     for i in range(row_count):
-        #         row = row_nodes.nth(i)
-        #         cell_nodes = row.locator("xpath=.//td").all()
+                headers = [h.strip() for h in table.locator("thead tr").first.locator("th").all_inner_texts()]
+                rows_locator = table.locator("tbody tr")
+                rows = []
+                events_chunk: List[List[str]] = []
+                for i in range(rows_locator.count()):
+                    row_locator = rows_locator.nth(i)
+                    cell_locators = row_locator.locator("td")
+                    row = []
+                    for j in range(cell_locators.count()):
+                        cell = cell_locators.nth(j)
+                        text = cell.inner_text().strip()
+                        if j == 0:
+                            anchor_locator = cell.locator("a")
+                            if anchor_locator.count():
+                                anchor = anchor_locator.first
+                                href = anchor.get_attribute("href") or ""
+                                title = anchor.get_attribute("title") or ""
+                                events_chunk.append([text, title, href])
+                        row.append(text)
+                    rows.append(row)
 
-        #         # Check for corporate event link in first cell
-        #         try:
-        #             first_td = row.locator("xpath=.//td[1]")
-        #             anchor = first_td.locator("xpath=.//a")
-        #             if anchor.count() > 0:
-        #                 href = anchor.first.get_attribute("href") or ""
-        #                 title = anchor.first.get_attribute("title") or ""
-        #                 date_text = first_td.inner_text().replace("\n", " ").strip()
-        #                 corp_events.append({
-        #                     "scrip": symbol.upper(),
-        #                     "date": date_text,
-        #                     "title": title,
-        #                     "href": BASE+href,
-        #                 })
-        #         except Exception:
-        #             raise RuntimeError("Error extracting special events")
+                if not rows:
+                    break
 
-        #         # Extract cell texts with formatting
-        #         cells = [c.inner_text().replace("\n", " ").strip() for c in cell_nodes]
+                df_chunk = pd.DataFrame(rows, columns=headers)
+                if "DATE" in df_chunk.columns:
+                    df_chunk["DATE"] = pd.to_datetime(df_chunk["DATE"], errors="coerce")
+                    valid_dates = df_chunk["DATE"].dropna()
+                else:
+                    valid_dates = pd.Series([], dtype="datetime64[ns]")
 
-        #         # Ensure row length matches headers by padding NA and record data error
-        #         if len(cells) != len(headers):
-        #             if len(cells) < len(headers):
-        #                 missing = len(headers) - len(cells)
-        #                 data_errors.append({
-        #                     "scrip": symbol.upper(),
-        #                     "date": cells[0] if cells else "",
-        #                     "missing_values": missing,
-        #                 })
-        #                 cells = cells + [pd.NA] * missing
-        #             else:
-        #                 cells = cells[: len(headers)]
+                if "DATE" in df_chunk.columns:
+                    mask = (df_chunk["DATE"] >= start_date) & (df_chunk["DATE"] <= end_date)
+                    df_filtered = df_chunk.loc[mask].copy()
+                else:
+                    df_filtered = df_chunk
 
-        #         # Buffer the row for later DataFrame construction
-        #         rows_buffer.append(cells)
+                if not df_filtered.empty:
+                    all_frames.append(df_filtered)
+                corporate_events.extend(events_chunk)
 
-        #     # Build DataFrame once for performance
-        #     df = pd.DataFrame(rows_buffer, columns=headers)
-        #     # Convert first column (Date) to datetime, drop invalid, set index
-        #     df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
-        #     df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
-        #     before = len(df)
-        #     df = df.dropna(subset=['Date'])
-        #     if len(df) != before:
-        #         print(f"[INFO] Dropped {before - len(df)} rows with invalid Date")
-        #     df = df.set_index('Date').sort_index()
+                if valid_dates.empty:
+                    break
 
-        #     # Output
-        #     print("===== equityHistoricalTable (head) =====")
-        #     print(df.head())
-        #     print(df.shape)
-        #     print("===== end head =====")
-        #     if data_errors:
-        #         print(f"[DATA ERRORS] {len(data_errors)} row(s) had missing values\n{data_errors}")
-        #     if corp_events:
-        #         print(f"[CORP EVENTS] {len(corp_events)} event link(s) captured\n{corp_events}")
-        # except PWTimeoutError:
-        #     print("Timeout Error")
-        # except Exception as e:
-        #     print(f"exception: {e}")
-        
-        page.wait_for_timeout(1_000)
+                actual_start = valid_dates.min()
+                actual_end = valid_dates.max()
+                print(f"Fetched chunk: {len(df_filtered)} rows, range {actual_start} -> {actual_end}")
 
-        context.close()
-        browser.close()
+                if actual_start <= start_date:
+                    break
+
+                current_end = (actual_start - pd.Timedelta(days=1)).normalize()
+
+            if all_frames:
+                final_df = pd.concat(all_frames, ignore_index=True)
+                final_df.drop_duplicates(inplace=True)
+                final_df.sort_values(by="DATE", ascending=False, inplace=True, na_position="last")
+                print(f"Accumulated table shape: {final_df.shape}")
+                print(final_df.head(10))
+                start_span = final_df["DATE"].min()
+                end_span = final_df["DATE"].max()
+                if pd.notna(start_span) and pd.notna(end_span):
+                    print(f"date range: {start_span} -> {end_span}")
+            else:
+                print("No data collected for requested range.")
+
+            print(f"corporate events: {corporate_events}")
+        finally:
+            browser.close()
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Open NSE page and click Historical Data tab")
-    parser.add_argument("--symbol", "-s", default="HCLTECH", help="NSE symbol, e.g., HCLTECH")
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run without visible browser window (default: False)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=60_000,
-        help="Navigation/selector timeout in ms (default: 60000)",
-    )
+    parser = argparse.ArgumentParser(description="Fetch NSE historical equity data over a date range.")
+    parser.add_argument("symbol")
+    parser.add_argument("--start-date", required=True, help=f"Start date ({DATE_FORMAT})")
+    parser.add_argument("--end-date", help=f"End date ({DATE_FORMAT}), defaults to today")
+    parser.add_argument("--no-headless", action="store_true")
     args = parser.parse_args()
 
-    main(symbol=args.symbol, headless_mode=args.headless, page_timeout_ms=args.timeout)
-    
+    overall_start = pd.to_datetime(args.start_date).normalize()
+    overall_end = (
+        pd.to_datetime(args.end_date).normalize()
+        if args.end_date
+        else pd.Timestamp.today().normalize()
+    )
+    if overall_end < overall_start:
+        raise ValueError("End date must be on or after start date.")
+
+    open_historical_tab(args.symbol, overall_start, overall_end, headless=not args.no_headless)
