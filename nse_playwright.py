@@ -1,5 +1,5 @@
-import argparse
-from typing import List
+import argparse, time
+from typing import List, Optional
 
 import pandas as pd
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
@@ -8,7 +8,18 @@ DATE_FORMAT = "%Y-%m-%d"
 DISPLAY_FORMAT = "%d-%m-%Y"
 
 
-def open_historical_tab(
+def wait_for_table_population(page, table_locator, retries: int = 3, delay_ms: int = 1000) -> bool:
+    """Poll the table for non-empty cell content, allowing the UI time to load."""
+    for check in range(retries):
+        cells_locator = table_locator.locator("tbody td")
+        if cells_locator.nth(0).inner_text().strip():
+            return True
+        else:
+            time.sleep(1)
+    return False
+
+
+def excrtact_scrip_data(
     symbol: str,
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
@@ -16,7 +27,7 @@ def open_historical_tab(
 ) -> None:
     url = f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}"
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        browser = p.firefox.launch(headless=headless)
         page = browser.new_page(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -28,105 +39,119 @@ def open_historical_tab(
             tab = page.get_by_role("tab", name="Historical Data")
             table = page.locator("#equityHistoricalTable")
 
-            for attempt in range(3):
-                if attempt:
-                    page.reload(wait_until="domcontentloaded")
-                else:
-                    page.goto(url, wait_until="domcontentloaded")
-                tab.click()
-                try:
-                    table.wait_for(state="visible", timeout=2000)
-                    break
-                except PlaywrightTimeoutError:
-                    page.wait_for_timeout(2000)
-            else:
-                raise RuntimeError("Response NA")
-
+            max_attempts = 3
             all_frames: List[pd.DataFrame] = []
             corporate_events: List[List[str]] = []
             current_end = end_date
+            last_error: Optional[Exception] = None
 
-            while current_end >= start_date:
-                window_start = current_end - pd.DateOffset(years=1)
-                if window_start < start_date:
-                    window_start = start_date
-
-                page.evaluate(
-                    """({ start, end }) => {
-                        if (window.$) {
-                            window.$('#startDate1').datepicker().value(start);
-                            window.$('#endDate1').datepicker().value(end);
-                        }
-                    }""",
-                    {
-                        "start": window_start.strftime(DISPLAY_FORMAT),
-                        "end": current_end.strftime(DISPLAY_FORMAT),
-                    },
-                )
-                page.get_by_role("button", name="Filter").click()
+            for attempt in range(max_attempts):
                 try:
-                    page.wait_for_load_state("networkidle", timeout=5000)
-                except PlaywrightTimeoutError:
-                    pass
-                page.wait_for_timeout(1000)
-                tab.click()
-                try:
+                    if attempt:
+                        page.reload(wait_until="domcontentloaded")
+                    else:
+                        page.goto(url, wait_until="domcontentloaded")
+                    tab.click()
                     table.wait_for(state="visible", timeout=2000)
-                except PlaywrightTimeoutError:
+
+                    while current_end >= start_date:
+                        window_start = current_end - pd.DateOffset(years=1)
+                        if window_start < start_date:
+                            window_start = start_date
+
+                        page.evaluate(
+                            """({ start, end }) => {
+                                if (window.$) {
+                                    window.$('#startDate1').datepicker().value(start);
+                                    window.$('#endDate1').datepicker().value(end);
+                                }
+                            }""",
+                            {
+                                "start": window_start.strftime(DISPLAY_FORMAT),
+                                "end": current_end.strftime(DISPLAY_FORMAT),
+                            },
+                        )
+                        page.get_by_role("button", name="Filter").click()
+                        time.sleep(2)
+                        print({f'chunking: {window_start} -> {current_end}'})
+
+                        if not wait_for_table_population(page, table):
+                            raise RuntimeError("Table populated with no data after retries.")
+
+                        try:
+                            page.wait_for_selector("#equityHistoricalTable tbody tr", timeout=2000)
+                        except PlaywrightTimeoutError as timeout_exc:
+                            raise RuntimeError("Table rows did not render in time.") from timeout_exc
+
+                        headers = [h.strip() for h in table.locator("thead tr").first.locator("th").all_inner_texts()]
+                        rows_locator = table.locator("tbody tr")
+                        rows = []
+                        events_chunk: List[List[str]] = []
+                        for i in range(rows_locator.count()):
+                            row_locator = rows_locator.nth(i)
+                            cell_locators = row_locator.locator("td")
+                            row = []
+                            if cell_locators.count() == 1:
+                                single_text = cell_locators.first.inner_text().strip()
+                                print(f"Single-cell row encountered: {single_text}")
+                                current_end = start_date - pd.Timedelta(days=1)
+                                break
+                            for j in range(cell_locators.count()):
+                                cell = cell_locators.nth(j)
+                                text = cell.inner_text().strip()
+                                if j == 0:
+                                    anchor_locator = cell.locator("a")
+                                    if anchor_locator.count():
+                                        anchor = anchor_locator.first
+                                        href = anchor.get_attribute("href") or ""
+                                        title = anchor.get_attribute("title") or ""
+                                        events_chunk.append([text, title, href])
+                                row.append(text)
+                            rows.append(row)
+
+                        if not rows:
+                            break
+
+                        df_chunk = pd.DataFrame(rows, columns=headers)
+                        if "DATE" in df_chunk.columns:
+                            df_chunk["DATE"] = pd.to_datetime(df_chunk["DATE"], errors="coerce")
+                            valid_dates = df_chunk["DATE"].dropna()
+                        else:
+                            valid_dates = pd.Series([], dtype="datetime64[ns]")
+
+                        if "DATE" in df_chunk.columns:
+                            mask = (df_chunk["DATE"] >= start_date) & (df_chunk["DATE"] <= end_date)
+                            df_filtered = df_chunk.loc[mask].copy()
+                        else:
+                            df_filtered = df_chunk
+
+                        if not df_filtered.empty:
+                            all_frames.append(df_filtered)
+                        corporate_events.extend(events_chunk)
+
+                        if valid_dates.empty:
+                            break
+
+                        actual_start = valid_dates.min()
+                        actual_end = valid_dates.max()
+                        print(f"Fetched chunk: {len(df_filtered)} rows, range {actual_start} -> {actual_end}")
+
+                        if actual_start <= start_date:
+                            break
+
+                        current_end = (actual_start - pd.Timedelta(days=1)).normalize()
+
                     break
 
-                headers = [h.strip() for h in table.locator("thead tr").first.locator("th").all_inner_texts()]
-                rows_locator = table.locator("tbody tr")
-                rows = []
-                events_chunk: List[List[str]] = []
-                for i in range(rows_locator.count()):
-                    row_locator = rows_locator.nth(i)
-                    cell_locators = row_locator.locator("td")
-                    row = []
-                    for j in range(cell_locators.count()):
-                        cell = cell_locators.nth(j)
-                        text = cell.inner_text().strip()
-                        if j == 0:
-                            anchor_locator = cell.locator("a")
-                            if anchor_locator.count():
-                                anchor = anchor_locator.first
-                                href = anchor.get_attribute("href") or ""
-                                title = anchor.get_attribute("title") or ""
-                                events_chunk.append([text, title, href])
-                        row.append(text)
-                    rows.append(row)
+                except Exception as exc:
+                    last_error = exc
+                    print(f"Attempt {attempt + 1}/{max_attempts} failed: {exc}")
+                    if attempt == max_attempts - 1:
+                        print(f"Stopping retries due to repeated failures: {exc}")
+                    continue
 
-                if not rows:
-                    break
-
-                df_chunk = pd.DataFrame(rows, columns=headers)
-                if "DATE" in df_chunk.columns:
-                    df_chunk["DATE"] = pd.to_datetime(df_chunk["DATE"], errors="coerce")
-                    valid_dates = df_chunk["DATE"].dropna()
-                else:
-                    valid_dates = pd.Series([], dtype="datetime64[ns]")
-
-                if "DATE" in df_chunk.columns:
-                    mask = (df_chunk["DATE"] >= start_date) & (df_chunk["DATE"] <= end_date)
-                    df_filtered = df_chunk.loc[mask].copy()
-                else:
-                    df_filtered = df_chunk
-
-                if not df_filtered.empty:
-                    all_frames.append(df_filtered)
-                corporate_events.extend(events_chunk)
-
-                if valid_dates.empty:
-                    break
-
-                actual_start = valid_dates.min()
-                actual_end = valid_dates.max()
-                print(f"Fetched chunk: {len(df_filtered)} rows, range {actual_start} -> {actual_end}")
-
-                if actual_start <= start_date:
-                    break
-
-                current_end = (actual_start - pd.Timedelta(days=1)).normalize()
+            if last_error and current_end >= start_date:
+                print(f"Terminated early at chunk ending {current_end}: {last_error}")
 
             if all_frames:
                 final_df = pd.concat(all_frames, ignore_index=True)
@@ -163,4 +188,4 @@ if __name__ == "__main__":
     if overall_end < overall_start:
         raise ValueError("End date must be on or after start date.")
 
-    open_historical_tab(args.symbol, overall_start, overall_end, headless=not args.no_headless)
+    excrtact_scrip_data(args.symbol, overall_start, overall_end, headless=not args.no_headless)
